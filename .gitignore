@@ -5,3 +5,7 @@ __pycache__/
 */.claude/
 */.DS_Store
 *.pyc
+deepspeed/dschat/utils/__pycache__/
+deepspeed/dschat/utils/data/__pycache__/
+deepspeed/dschat/utils/model/__pycache__/
+deepspeed/dschat/utils/module/__pycache__/
