@@ -32,9 +32,16 @@ def main():
     # e.g. dp_size, mem_fraction_static
     llm = sgl.Engine(
         model_path=model_path,
+<<<<<<< HEAD
         dp_size=2,
         mem_fraction_static=0.60,
         attention_backend="dual_chunk_flash_attn",
+=======
+        mem_fraction_static=0.8,  
+        tp_size=8,    
+        cuda_graph_max_bs=64,
+        trust_remote_code=True,
+>>>>>>> cde9f9a767b2995d9ab8340d75cf1290206f7a9a
     )
 
     prompts = []
@@ -46,6 +53,7 @@ def main():
 
     outputs = []
 
+<<<<<<< HEAD
     batch_size = 64
 
     from tqdm import tqdm
@@ -54,6 +62,26 @@ def main():
         batch_outputs = llm.generate(batch_prompts, sampling_params)
         for out in batch_outputs:
             outputs.append(out["text"])
+=======
+    # TODO: you may want to explore different batch_size
+    batch_size = 16 #len(prompts) 
+
+    from tqdm import tqdm
+    for i in tqdm(range(0, len(prompts), batch_size)):
+        # TODO: prepare the batched prompts and use llm.generate
+        # save the output in outputs
+        batch_prompts = prompts[i:i+batch_size]
+        
+        # Generate responses for the batch
+        batch_outputs = llm.generate(
+            batch_prompts,
+            sampling_params=sampling_params
+        )
+        
+        # Extract the generated text from the outputs
+        for output in batch_outputs:
+            outputs.append(output)
+>>>>>>> cde9f9a767b2995d9ab8340d75cf1290206f7a9a
 
     with open(args.output_file, "w") as f:
         for i in range(0, len(outputs), 10):
