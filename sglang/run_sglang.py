@@ -1,47 +1,9 @@
-import json
-import os
-import sys
-from pathlib import Path
-
-_script_dir = Path(__file__).resolve().parent
-_repo_root = _script_dir.parent
-
-
-def _fix_sys_path_for_sglang_package() -> None:
-    """This homework lives in a directory named ``sglang/``. If the repo root
-    is on ``sys.path`` (common when running from the project root), Python can
-    treat ``<repo>/sglang`` as the top-level ``sglang`` package and shadow the
-    real ``sglang`` library from pip."""
-    while str(_repo_root) in sys.path:
-        sys.path.remove(str(_repo_root))
-    if sys.path[:1] == [""] and Path.cwd().resolve() == _repo_root:
-        sys.path.pop(0)
-    os.chdir(_script_dir)
-
-
-_fix_sys_path_for_sglang_package()
-
-import argparse
-
 from datasets import load_dataset
-from tqdm import tqdm
-
 import sglang as sgl
-
-
-def _texts_from_generate(result):
-    """Normalize Engine.generate return value across single/batch prompts."""
-    if isinstance(result, dict):
-        return [result.get("text", "")]
-    if isinstance(result, list):
-        out = []
-        for item in result:
-            if isinstance(item, dict):
-                out.append(item.get("text", ""))
-            else:
-                out.append(str(item))
-        return out
-    return [str(result)]
+import json
+import argparse
+from tqdm import tqdm
+from transformers import AutoTokenizer
 
 
 def main():
@@ -57,16 +19,28 @@ def main():
         default="outputs.jsonl",
     )
     parser.add_argument(
-        "--batch_size",
+        "--dp_size",
         type=int,
-        default=16,
-        help="Number of prompts per generate() call.",
+        default=1,
+        help="Data parallelism size (number of GPUs for DP)",
+    )
+    parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="Tensor parallelism size (number of GPUs for TP)",
     )
     parser.add_argument(
         "--mem_fraction_static",
         type=float,
         default=0.85,
-        help="Fraction of GPU memory reserved for static allocations (KV etc.).",
+        help="Fraction of GPU memory reserved for static KV cache",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=256,
+        help="Number of prompts per generate call",
     )
     args = parser.parse_args()
 
@@ -79,44 +53,53 @@ def main():
     )
     model_path = args.model_path
 
+    # Initialize SGLang offline engine.
+    # dp_size / tp_size let you spread across multiple GPUs;
+    # mem_fraction_static controls how much VRAM is pre-allocated for the KV cache.
     llm = sgl.Engine(
         model_path=model_path,
+        dp_size=args.dp_size,
+        tp_size=args.tp_size,
         mem_fraction_static=args.mem_fraction_static,
-        trust_remote_code=True,
+        # Required for long-context models that use dual chunk attention
+        # (e.g. Qwen2.5-*-1M).  flashinfer (the default) does not support it.
+        attention_backend="dual_chunk_flash_attn",
     )
 
-    prompts = [row["instruction"] for row in dataset]
+    # Apply the model's chat template so instruction-following works correctly.
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    raw_prompts = [item["instruction"] for item in dataset]
+    prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in raw_prompts
+    ]
 
     sampling_params = {"temperature": 0.7, "top_p": 0.95, "max_new_tokens": 8192}
 
     outputs = []
-    batch_size = max(1, args.batch_size)
 
-    try:
-        for start in tqdm(range(0, len(prompts), batch_size)):
-            batch = prompts[start:start + batch_size]
-            result = llm.generate(prompt=batch, sampling_params=sampling_params)
-            texts = _texts_from_generate(result)
-            if len(texts) != len(batch):
-                raise RuntimeError(
-                    f"Expected {len(batch)} outputs, got {len(texts)} from generate()"
-                )
-            outputs.extend(texts)
-    finally:
-        llm.shutdown()
+    batch_size = args.batch_size
+    for i in tqdm(range(0, len(prompts), batch_size)):
+        batch = prompts[i : i + batch_size]
+        batch_outputs = llm.generate(batch, sampling_params)
+        # Each element is a dict with key "text" containing the generated string.
+        for out in batch_outputs:
+            outputs.append(out["text"])
 
     with open(args.output_file, "w") as f:
-        for instruction, output in zip(prompts, outputs):
-            f.write(
-                json.dumps(
-                    {
-                        "output": output,
-                        "instruction": instruction,
-                    }
-                )
-                + "\n"
-            )
+        for i in range(len(outputs)):
+            f.write(json.dumps({
+                "output": outputs[i],
+                "instruction": raw_prompts[i],
+            }) + "\n")
+
+    llm.shutdown()
 
 
 if __name__ == "__main__":
     main()
+

@@ -1,63 +1,101 @@
 """
-Modal version of run_sglang.py — runs SGLang inference on a Modal A100 GPU.
+Run the SGLang alpaca-eval inference job on Modal (GPU cloud).
 
 Usage:
+    # First run: downloads model weights into the persistent volume (~15 GB).
+    # Subsequent runs skip the download and start immediately.
     modal run run_sglang_modal.py
-    modal run run_sglang_modal.py --model-path Qwen/Qwen2.5-7B-Instruct-1M
-    modal run run_sglang_modal.py --model-path Qwen/Qwen2.5-7B-Instruct-1M --batch-size 32
+
+    # Override model / output file:
+    modal run run_sglang_modal.py --model-path Qwen/Qwen2.5-7B-Instruct \
+                                   --output-file my_outputs.jsonl
 """
 
+import modal
 import json
 import os
 
-import modal
+# ---------------------------------------------------------------------------
+# Persistent volume — model weights are downloaded here once and reused.
+# ---------------------------------------------------------------------------
+model_vol = modal.Volume.from_name("sglang-model-weights", create_if_missing=True)
+MODEL_DIR = "/models"
+DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct-1M"
 
 # ---------------------------------------------------------------------------
-# Modal image — install SGLang and dependencies
+# Image — CUDA 12.8 devel (matches Modal A100 runtime) + libnuma for sgl_kernel.
 # ---------------------------------------------------------------------------
-
-image = (
-    modal.Image.debian_slim(python_version="3.11")
+sglang_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
+        add_python="3.10",
+    )
+    .apt_install("libnuma-dev")
     .pip_install(
-        "sglang[all]>=0.4.0",
+        "sglang[all]>=0.3.0",
         "datasets",
-        "huggingface_hub",
+        "transformers",
+        "accelerate",
         "tqdm",
-        "torch",
-        extra_options="--find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/",
+        "huggingface_hub",
     )
 )
 
-app = modal.App("sglang-inference", image=image)
+app = modal.App("sglang-alpaca-eval", image=sglang_image)
 
-# Persistent volume to cache downloaded model weights across runs
-model_cache = modal.Volume.from_name("sglang-model-cache", create_if_missing=True)
 
 # ---------------------------------------------------------------------------
-# Remote function
+# Download function — run once to populate the volume, then cached forever.
+# Call explicitly with:  modal run run_sglang_modal.py::download_model
 # ---------------------------------------------------------------------------
-
 @app.function(
-    gpu="A100",
-    timeout=60 * 60,           # 1 hour — large models can take time
-    volumes={"/model-cache": model_cache},
-    # secrets=[modal.Secret.from_name("huggingface-secret")],  # uncomment if using gated models
+    volumes={MODEL_DIR: model_vol},
+    timeout=3600,
+)
+def download_model(model_id: str = DEFAULT_MODEL):
+    from huggingface_hub import snapshot_download
+    local_path = os.path.join(MODEL_DIR, model_id.replace("/", "--"))
+    if os.path.isdir(local_path) and os.listdir(local_path):
+        print(f"Model already cached at {local_path}, skipping download.")
+        return local_path
+    print(f"Downloading {model_id} → {local_path} ...")
+    snapshot_download(repo_id=model_id, local_dir=local_path)
+    model_vol.commit()
+    print("Download complete.")
+    return local_path
+
+
+# ---------------------------------------------------------------------------
+# Core inference function
+# ---------------------------------------------------------------------------
+# To use a gated model, first create a Modal secret:
+#   modal secret create huggingface-secret HUGGING_FACE_HUB_TOKEN=hf_...
+# then add  secrets=[modal.Secret.from_name("huggingface-secret")]  below.
+@app.function(
+    gpu="A100-80GB",
+    timeout=7200,
+    volumes={MODEL_DIR: model_vol},
 )
 def run_inference(
-    model_path: str = "Qwen/Qwen2.5-7B-Instruct-1M",
-    batch_size: int = 16,
-    mem_fraction_static: float = 0.85,
+    model_id: str = DEFAULT_MODEL,
+    dp_size: int = 1,
+    tp_size: int = 1,
+    mem_fraction_static: float = 0.80,
+    batch_size: int = 256,
 ) -> list[dict]:
-    """Run SGLang inference on alpaca_eval and return results as a list of dicts."""
-    import sglang as sgl
+    """Run SGLang offline inference on the AlpacaEval benchmark."""
     from datasets import load_dataset
+    import sglang as sgl
+    from transformers import AutoTokenizer
     from tqdm import tqdm
 
-    # Point HF cache at the persistent volume so weights are reused
-    os.environ["HF_HOME"] = "/model-cache/hf"
-    os.environ["TRANSFORMERS_CACHE"] = "/model-cache/hf"
+    local_path = os.path.join(MODEL_DIR, model_id.replace("/", "--"))
+    if not os.path.isdir(local_path) or not os.listdir(local_path):
+        raise RuntimeError(
+            f"Model weights not found at {local_path}. "
+            "Run `modal run run_sglang_modal.py::download_model` first."
+        )
 
-    print(f"Loading alpaca_eval dataset ...")
     dataset = load_dataset(
         "json",
         data_files={
@@ -66,75 +104,71 @@ def run_inference(
         split="eval",
     )
 
-    prompts = [row["instruction"] for row in dataset]
-    print(f"Loaded {len(prompts)} prompts.")
-
-    print(f"Initialising SGLang engine with model: {model_path}")
     llm = sgl.Engine(
-        model_path=model_path,
+        model_path=local_path,
+        dp_size=dp_size,
+        tp_size=tp_size,
         mem_fraction_static=mem_fraction_static,
-        trust_remote_code=True,
+        # Required for long-context models that use dual chunk attention
+        # (e.g. Qwen2.5-*-1M).  flashinfer (the default) does not support it.
         attention_backend="dual_chunk_flash_attn",
+        # Cap CUDA graph capture batch sizes to avoid OOM during init.
+        cuda_graph_max_bs=4,
     )
 
-    sampling_params = {"temperature": 0.7, "top_p": 0.95, "max_new_tokens": 8192}
-    outputs = []
-    batch_size = max(1, batch_size)
+    tokenizer = AutoTokenizer.from_pretrained(local_path)
+    raw_prompts = [item["instruction"] for item in dataset]
+    prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in raw_prompts
+    ]
 
-    try:
-        for start in tqdm(range(0, len(prompts), batch_size), desc="Generating"):
-            batch = prompts[start : start + batch_size]
-            result = llm.generate(prompt=batch, sampling_params=sampling_params)
-            texts = _texts_from_generate(result)
-            if len(texts) != len(batch):
-                raise RuntimeError(
-                    f"Expected {len(batch)} outputs, got {len(texts)} from generate()"
-                )
-            outputs.extend(texts)
-    finally:
-        llm.shutdown()
+    sampling_params = {"temperature": 0.7, "top_p": 0.95, "max_new_tokens": 8192}
+
+    outputs = []
+    for i in tqdm(range(0, len(prompts), batch_size)):
+        batch = prompts[i : i + batch_size]
+        batch_outputs = llm.generate(batch, sampling_params)
+        for out in batch_outputs:
+            outputs.append(out["text"])
+
+    llm.shutdown()
 
     return [
-        {"instruction": instruction, "output": output}
-        for instruction, output in zip(prompts, outputs)
+        {"output": outputs[i], "instruction": raw_prompts[i]}
+        for i in range(len(outputs))
     ]
 
 
-def _texts_from_generate(result):
-    """Normalize Engine.generate return value across single/batch prompts."""
-    if isinstance(result, dict):
-        return [result.get("text", "")]
-    if isinstance(result, list):
-        out = []
-        for item in result:
-            if isinstance(item, dict):
-                out.append(item.get("text", ""))
-            else:
-                out.append(str(item))
-        return out
-    return [str(result)]
-
-
 # ---------------------------------------------------------------------------
-# Local entrypoint — call the remote function and save results
+# Local entrypoint — downloads model if needed, then runs inference.
 # ---------------------------------------------------------------------------
-
 @app.local_entrypoint()
 def main(
-    model_path: str = "Qwen/Qwen2.5-7B-Instruct-1M",
+    model_id: str = DEFAULT_MODEL,
     output_file: str = "outputs.jsonl",
-    batch_size: int = 16,
-    mem_fraction_static: float = 0.85,
+    dp_size: int = 1,
+    tp_size: int = 1,
+    mem_fraction_static: float = 0.80,
+    batch_size: int = 256,
 ):
-    print(f"Submitting job to Modal (GPU: A100) ...")
+    # Ensure weights are present in the volume before inference starts.
+    download_model.remote(model_id=model_id)
+
     results = run_inference.remote(
-        model_path=model_path,
-        batch_size=batch_size,
+        model_id=model_id,
+        dp_size=dp_size,
+        tp_size=tp_size,
         mem_fraction_static=mem_fraction_static,
+        batch_size=batch_size,
     )
 
     with open(output_file, "w") as f:
-        for row in results:
-            f.write(json.dumps(row) + "\n")
+        for record in results:
+            f.write(json.dumps(record) + "\n")
 
-    print(f"Saved {len(results)} outputs to {output_file}")
+    print(f"Wrote {len(results)} results to {output_file}")
