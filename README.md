@@ -71,7 +71,6 @@ SGLang's backend in built on [flashinfer](https://arxiv.org/abs/2501.01005).
 To use SGLang for inference is very simple. Please try to fill out the TODOs in `sglang/run_sglang.py`. You should be able to finish all generations in under 15 minutes. You are also welcomed to explore different parameter settings to make the run faster! 
 
 ```{.Bash bgcolor="LightGray"}
-srun --partition=GPU-dev --gres=gpu:a100:1 --ntasks=1 --cpus-per-task=8 --mem=40G --pty bash
 cd sglang
 python run_sglang.py
 ```
